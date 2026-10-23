@@ -11,6 +11,10 @@ on:
         description: "源码分支或标签"
         required: false
         default: "25.12"
+      variants:
+        description: "要构建的版本（all / daed-qmodem / openclash-qmodem / full）"
+        required: false
+        default: "all"
   push:
     branches: [main]
     paths:
@@ -19,22 +23,57 @@ on:
   schedule:
     - cron: "0 18 * * 5"
 
-concurrency:
-  group: build-xr30-${{ github.ref }}
-  cancel-in-progress: false
-
 permissions:
   contents: write
 
 jobs:
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.set.outputs.matrix }}
+    steps:
+      - id: set
+        shell: bash
+        run: |
+          ALL='{"include":[
+            {"name":"daed-qmodem","label":"daed + qmodem","feeds":"kenzok-daed qmodem","fragments":"qmodem daed","expect":"daed,luci-app-daede,luci-app-qmodem"},
+            {"name":"openclash-qmodem","label":"openclash + qmodem","feeds":"openclash qmodem","fragments":"qmodem openclash","expect":"luci-app-openclash,luci-app-qmodem"},
+            {"name":"full","label":"daed + openclash + qmodem + 常用插件","feeds":"kenzok-daed openclash qmodem","fragments":"qmodem daed openclash common-apps","expect":"daed,luci-app-daede,luci-app-openclash,luci-app-qmodem"}
+          ]}'
+          SEL='${{ github.event.inputs.variants }}'
+          if [ -z "$SEL" ] || [ "$SEL" = "all" ]; then
+            echo "matrix=$ALL" >> "$GITHUB_OUTPUT"
+            echo "构建全部 3 个版本"
+          else
+            case "$SEL" in
+              daed-qmodem)
+                M='{"include":[{"name":"daed-qmodem","label":"daed + qmodem","feeds":"kenzok-daed qmodem","fragments":"qmodem daed","expect":"daed,luci-app-daede,luci-app-qmodem"}]}' ;;
+              openclash-qmodem)
+                M='{"include":[{"name":"openclash-qmodem","label":"openclash + qmodem","feeds":"openclash qmodem","fragments":"qmodem openclash","expect":"luci-app-openclash,luci-app-qmodem"}]}' ;;
+              full)
+                M='{"include":[{"name":"full","label":"daed + openclash + qmodem + 常用插件","feeds":"kenzok-daed openclash qmodem","fragments":"qmodem daed openclash common-apps","expect":"daed,luci-app-daede,luci-app-openclash,luci-app-qmodem"}]}' ;;
+              *)
+                echo "::error::未知版本: $SEL"; exit 1 ;;
+            esac
+            echo "matrix=$M" >> "$GITHUB_OUTPUT"
+            echo "构建单个版本: $SEL"
+          fi
+
   build:
+    needs: prepare
     runs-on: ubuntu-22.04
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    concurrency:
+      group: build-xr30-${{ matrix.name }}-${{ github.ref }}
+      cancel-in-progress: false
     env:
       SOURCE_URL: ${{ github.event.inputs.source_url || 'https://github.com/chasey-dev/immortalwrt-mt798x-rebase.git' }}
       SOURCE_REF: ${{ github.event.inputs.source_ref || '25.12' }}
       DEVICE: cmcc_xr30-nand-mtkuboot
-      FEED_REPO: https://github.com/kenzok8/openwrt-daede.git
+    name: ${{ matrix.name }} (${{ matrix.label }})
 
     steps:
       - name: 检出仓库
@@ -63,18 +102,20 @@ jobs:
         run: |
           echo "源码: $SOURCE_URL ($SOURCE_REF)"
           git clone --depth 1 --branch "$SOURCE_REF" "$SOURCE_URL" openwrt
-          cd openwrt
-          git log -1 --format='源码 HEAD: %H%n提交信息: %s'
+          git -C openwrt log -1 --format='源码 HEAD: %H%n提交信息: %s'
 
-      - name: 附加自定义包 kenzok-daed
+      - name: 附加自定义包
         run: |
+          declare -A URLS=(
+            [kenzok-daed]="https://github.com/kenzok8/openwrt-daede.git"
+            [openclash]="https://github.com/vernesong/OpenClash.git"
+            [qmodem]="https://github.com/FuJr/QModem.git"
+          )
           mkdir -p openwrt/package/custom
-          git clone --depth 1 "$FEED_REPO" openwrt/package/custom/kenzok-daed
-          cd openwrt/package/custom/kenzok-daed
-          git log -1 --format='feed HEAD: %H %s'
-          echo "--- 该 feed 提供的包 ---"
-          for mf in $(find . -maxdepth 2 -name Makefile); do
-            grep -hE '^PKG_NAME' "$mf" 2>/dev/null || true
+          for f in ${{ matrix.feeds }}; do
+            echo ">>> 克隆 $f"
+            git clone --depth 1 "${URLS[$f]}" "openwrt/package/custom/$f"
+            git -C "openwrt/package/custom/$f" log -1 --format="    HEAD: %h %s"
           done
 
       - name: 更新并安装 feeds
@@ -83,24 +124,44 @@ jobs:
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
-      - name: 应用 XR30 配置
+      - name: 生成配置（基线 + 片段）
         run: |
           cp config/xr30.defconfig openwrt/.config
+          for f in ${{ matrix.fragments }}; do
+            echo ">>> 叠加片段: $f"
+            grep -vE '^\s*#' "config/fragments/$f.config" | grep -vE '^\s*$' >> openwrt/.config
+          done
           cd openwrt
           make defconfig
-          echo "--- 校验 ---"
+          echo "--- 设备 ---"
           grep -E '^CONFIG_TARGET_PROFILE=' .config
-          grep -E '^CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_xr30-nand-mtkuboot=y$' .config || {
-            echo "::error::设备 $DEVICE 未在配置中启用"; exit 1; }
+          grep -qE '^CONFIG_TARGET_mediatek_filogic_DEVICE_cmcc_xr30-nand-mtkuboot=y$' .config || {
+            echo "::error::设备 $DEVICE 未启用"; exit 1; }
           echo "包总数: $(grep -cE '^CONFIG_PACKAGE_[^=]+=y$' .config)"
-          grep -E '^CONFIG_PACKAGE_(daed|luci-app-daede)=y$' .config || true
+
+      - name: 校验关键插件
+        run: |
+          cd openwrt
+          MISSING=""
+          for p in $(echo "${{ matrix.expect }}" | tr ',' ' '); do
+            if grep -qE "^CONFIG_PACKAGE_${p}=y$" .config; then
+              echo "  ✅ $p"
+            else
+              echo "  ❌ $p"; MISSING="$MISSING $p"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::以下关键插件未被启用:$MISSING"
+            exit 1
+          fi
 
       - name: 缓存源码包 dl
         uses: actions/cache@v4
         with:
           path: openwrt/dl
-          key: dl-xr30-${{ hashFiles('config/xr30.defconfig') }}
+          key: dl-xr30-${{ matrix.name }}-${{ hashFiles('config/xr30.defconfig', 'config/fragments/*.config') }}
           restore-keys: |
+            dl-xr30-${{ matrix.name }}-
             dl-xr30-
 
       - name: 下载依赖源码包
@@ -115,28 +176,39 @@ jobs:
 
       - name: 收集产物
         run: |
-          mkdir -p out
+          mkdir -p "out/${{ matrix.name }}"
           find openwrt/bin/targets -type f \
             \( -name '*cmcc_xr30-nand-mtkuboot*.bin' \
             -o -name 'profiles.json' \
             -o -name 'config.buildinfo' \
             -o -name 'feeds.buildinfo' \
             -o -name 'version.buildinfo' \) \
-            -exec cp -v {} out/ \;
+            -exec cp -v {} "out/${{ matrix.name }}/" \;
           echo "--- 产物清单 ---"
-          ls -lh out/
+          ls -lh "out/${{ matrix.name }}/"
 
       - name: 上传固件
         uses: actions/upload-artifact@v4
         with:
-          name: xr30-firmware-run${{ github.run_number }}
-          path: out/
+          name: xr30-${{ matrix.name }}-run${{ github.run_number }}
+          path: out/${{ matrix.name }}/
           retention-days: 30
           if-no-files-found: error
 
-      - name: 发布 Release（仅 tag 触发）
-        if: startsWith(github.ref, 'refs/tags/')
+  release:
+    needs: [prepare, build]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    steps:
+      - name: 下载全部产物
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          pattern: xr30-*
+          merge-multiple: false
+
+      - name: 发布 Release
         uses: softprops/action-gh-release@v2
         with:
-          files: out/*
+          files: release/**/*
           generate_release_notes: true
