@@ -33,31 +33,42 @@ jobs:
       matrix: ${{ steps.set.outputs.matrix }}
     steps:
       - id: set
+        name: 生成构建矩阵
         shell: bash
         run: |
-          ALL='{"include":[
-            {"name":"daed-qmodem","label":"daed + qmodem","feeds":"kenzok-daed qmodem","fragments":"qmodem daed","expect":"daed,luci-app-daede,luci-app-qmodem"},
-            {"name":"openclash-qmodem","label":"openclash + qmodem","feeds":"openclash qmodem","fragments":"qmodem openclash","expect":"luci-app-openclash,luci-app-qmodem"},
-            {"name":"full","label":"daed + openclash + qmodem + 常用插件","feeds":"kenzok-daed openclash qmodem","fragments":"qmodem daed openclash common-apps","expect":"daed,luci-app-daede,luci-app-openclash,luci-app-qmodem"}
-          ]}'
-          SEL='${{ github.event.inputs.variants }}'
-          if [ -z "$SEL" ] || [ "$SEL" = "all" ]; then
-            echo "matrix=$ALL" >> "$GITHUB_OUTPUT"
-            echo "构建全部 3 个版本"
-          else
-            case "$SEL" in
-              daed-qmodem)
-                M='{"include":[{"name":"daed-qmodem","label":"daed + qmodem","feeds":"kenzok-daed qmodem","fragments":"qmodem daed","expect":"daed,luci-app-daede,luci-app-qmodem"}]}' ;;
-              openclash-qmodem)
-                M='{"include":[{"name":"openclash-qmodem","label":"openclash + qmodem","feeds":"openclash qmodem","fragments":"qmodem openclash","expect":"luci-app-openclash,luci-app-qmodem"}]}' ;;
-              full)
-                M='{"include":[{"name":"full","label":"daed + openclash + qmodem + 常用插件","feeds":"kenzok-daed openclash qmodem","fragments":"qmodem daed openclash common-apps","expect":"daed,luci-app-daede,luci-app-openclash,luci-app-qmodem"}]}' ;;
-              *)
-                echo "::error::未知版本: $SEL"; exit 1 ;;
-            esac
-            echo "matrix=$M" >> "$GITHUB_OUTPUT"
-            echo "构建单个版本: $SEL"
+          set -euo pipefail
+
+          count=0
+          declare -A ITEMS
+
+          ITEMS[daed-qmodem]='{"name":"daed-qmodem","label":"daed + qmodem","feeds":"kenzok-daed qmodem","fragments":"qmodem daed","expect":"daed,luci-app-daede,luci-app-qmodem"}'
+          ITEMS[openclash-qmodem]='{"name":"openclash-qmodem","label":"openclash + qmodem","feeds":"openclash qmodem","fragments":"qmodem openclash","expect":"luci-app-openclash,luci-app-qmodem"}'
+          ITEMS[full]='{"name":"full","label":"daed + openclash + qmodem + 常用插件","feeds":"kenzok-daed openclash qmodem","fragments":"qmodem daed openclash common-apps","expect":"daed,luci-app-daede,luci-app-openclash,luci-app-qmodem"}'
+
+          SELECTED="${{ github.event.inputs.variants }}"
+          if [ -z "$SELECTED" ] || [ "$SELECTED" = "all" ]; then
+            SELECTED="daed-qmodem openclash-qmodem full"
           fi
+
+          items=""
+          for v in $SELECTED; do
+            if [ -z "${ITEMS[$v]:-}" ]; then
+              echo "::error::未知版本: $v（可选: daed-qmodem / openclash-qmodem / full）"
+              exit 1
+            fi
+            if [ -n "$items" ]; then items="$items,"; fi
+            items="$items${ITEMS[$v]}"
+          done
+
+          MATRIX=$(printf '{"include":[%s]}' "$items")
+          echo "生成的 matrix:"
+          echo "$MATRIX"
+
+          {
+            echo "matrix<<MATRIX_EOF"
+            echo "$MATRIX"
+            echo "MATRIX_EOF"
+          } >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -129,7 +140,7 @@ jobs:
           cp config/xr30.defconfig openwrt/.config
           for f in ${{ matrix.fragments }}; do
             echo ">>> 叠加片段: $f"
-            grep -vE '^\s*#' "config/fragments/$f.config" | grep -vE '^\s*$' >> openwrt/.config
+            grep -vE '^[[:space:]]*#' "config/fragments/$f.config" | grep -vE '^[[:space:]]*$' >> openwrt/.config
           done
           cd openwrt
           make defconfig
